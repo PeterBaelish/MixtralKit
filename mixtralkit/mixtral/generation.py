@@ -147,6 +147,9 @@ class Mixtral:
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
         # assert max_prompt_len <= params.max_seq_len
+        if max_prompt_len >= params.max_seq_len:
+            return []
+
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
@@ -172,13 +175,13 @@ class Mixtral:
             )
 
         for cur_pos in range(min_prompt_len, total_len):
-            '''
+            ''''''
             print("==============================================================================")
             print("current_position:", cur_pos)
             print("current token:", self.tokenizer.decode(tokens[0, prev_pos].tolist()))
             
             start_time = time.time()
-            '''
+            
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             '''
             probs, _ = torch.max(torch.softmax(logits[:, -1], dim=-1),dim=1) # probs: (bsz)
@@ -211,7 +214,7 @@ class Mixtral:
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 next_token == self.tokenizer.eos_id
             )
-            '''
+            ''''''
             end_time = time.time()
             elapsed_time = (end_time - start_time) * 1000
             
@@ -219,7 +222,7 @@ class Mixtral:
                 print(f"prefill time: {elapsed_time} ms")
             else:
                 print(f"decode time(generate 1 token): {elapsed_time} ms")
-            '''    
+                
             prev_pos = cur_pos
             if all(eos_reached):
                 break
@@ -283,16 +286,19 @@ class Mixtral:
             logprobs=logprobs,
             echo=echo,
         )
-        if logprobs:
-            return [
-                {
-                    "generation": self.tokenizer.decode(t),
-                    "tokens": [self.tokenizer.decode(x) for x in t],
-                    "logprobs": logprobs_i,
-                }
-                for t, logprobs_i in zip(generation_tokens, generation_logprobs)
-            ]
-        return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
+        if generation_tokens == []:
+            return []
+        else:
+            if logprobs:
+                return [
+                    {
+                        "generation": self.tokenizer.decode(t),
+                        "tokens": [self.tokenizer.decode(x) for x in t],
+                        "logprobs": logprobs_i,
+                    }
+                    for t, logprobs_i in zip(generation_tokens, generation_logprobs)
+                ]
+            return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
     def chat_completion(
         self,

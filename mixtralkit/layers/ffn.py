@@ -81,9 +81,12 @@ class TorchFFN(nn.Module):
         ).to(device)
 
     def forward(self, x):
+        '''
         device = x.device
         x = x.to(self.w1.weight.device)
         return self.w2(F.silu(self.w1(x)) * self.w3(x)).to(device)
+        '''
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
 class FairScaleFFN(nn.Module):
