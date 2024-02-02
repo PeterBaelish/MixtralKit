@@ -453,69 +453,60 @@ class PreloadMoETorchTransformer(TorchTransformer):
                 attn_mask
             ]).type_as(h)
 
+        # code before layer 0 expert copy
+        # Layer0 Attn
+        h = h + self.layers[0].attention.forward(
+            self.layers[0].attention_norm(h), start_pos, freqs_cis, attn_mask
+        )
+        h_store = h
+
+        # Gate for layer0 expert
+        z = self.layers[0].ffn_norm(h)
+
+        orig_shape = z.shape
+        z = z.view(-1, z.shape[-1])
+
+        if self.layers[0].feed_forward.gate_softmax:
+            scores = self.layers[0].feed_forward.gate(z).softmax(dim=-1)
+        else:
+            scores = self.layers[0].feed_forward.gate(z)
+
+        expert_weights, expert_indices = torch.topk(
+            scores, self.layers[0].feed_forward.num_experts_per_tok, dim=-1)
+        expert_weights = expert_weights.softmax(dim=-1)
+
+        flat_expert_indices = expert_indices.view(-1)
+
+        z = z.repeat_interleave(self.layers[0].feed_forward.num_experts_per_tok, dim=0)
+        y = torch.empty_like(z)
+
+        print("Selected experts", expert_indices)
+
+        # predict layer1 expert
+        
+        x = self.layers[1].ffn_norm(h_store)
+        x = x.view(-1, x.shape[-1])
+
+        if self.layers[1].feed_forward.gate_softmax:
+            scores = self.layers[1].feed_forward.gate(x).softmax(dim=-1)
+        else:
+            scores = self.layers[1].feed_forward.gate(x)
+
+        predict_expert_weights, predict_expert_indices = torch.topk(
+            scores, self.layers[1].feed_forward.num_experts_per_tok, dim=-1)
+        
+        predict_flat_expert_indices = predict_expert_indices.view(-1)
+        print("Predict experts", predict_expert_indices)
+
         # print("token begin")
         for i, layer in enumerate(self.layers):
 
-            #normal Attn
+            # Copy expert for i layer
             with torch.cuda.stream(self.normal_stream):
-                h = h + layer.attention.forward(
-                    layer.attention_norm(h), start_pos, freqs_cis, attn_mask
-                )
-                h_store = h
 
-                next_feedforward = self.layers[i+1].feed_forward if i+1 < self.n_layers else None
-
-                # compute&load current layer expert, predict next layer expert
-
-                # h = h + layer.feed_forward.forward(layer.ffn_norm(h))
-                z = layer.ffn_norm(h)
-
-                orig_shape = z.shape
-                z = z.view(-1, z.shape[-1])
-                device = z.device
-
-                if layer.feed_forward.gate_softmax:
-                    scores = layer.feed_forward.gate(z).softmax(dim=-1)
-                else:
-                    scores = layer.feed_forward.gate(z)
-
-                expert_weights, expert_indices = torch.topk(
-                    scores, layer.feed_forward.num_experts_per_tok, dim=-1)
-                expert_weights = expert_weights.softmax(dim=-1)
-
-                flat_expert_indices = expert_indices.view(-1)
-
-                z = z.repeat_interleave(layer.feed_forward.num_experts_per_tok, dim=0)
-                y = torch.empty_like(z)
-
+                preload_flat_expert_indices = predict_flat_expert_indices
                 gpu_expert = 0
 
-                # print("Selected experts", expert_indices)
-
-                # predict next expert
-                if next_feedforward is not None:
-                    x = self.layers[i+1].ffn_norm(h_store)
-                    x = x.view(-1, x.shape[-1])
-
-                    if next_feedforward.gate_softmax:
-                        scores = next_feedforward.gate(x).softmax(dim=-1)
-                    else:
-                        scores = next_feedforward.gate(x)
-
-                    predict_expert_weights, predict_expert_indices = torch.topk(
-                        scores, next_feedforward.num_experts_per_tok, dim=-1)
-                    
-                    predict_flat_expert_indices = predict_expert_indices.view(-1)
-                    # print("Predict experts", predict_expert_indices)
-
-            ## VERY IMPORTANT: WE MUST SYNC HERE, OTHERWISE PRELOAD AND COPY WILL CONTENT!!
-
-            # Sync
-            self.lib.synchronizeStream(self.stream)
-            self.lib.synchronizeStream(self.normal_stream)     
-            
-
-            with torch.cuda.stream(self.normal_stream):
                 #split copy and compute in decode, but normal in prefill
                 if start_pos == 0: # prefill. We don't split copy and compute here since we cannot load all the experts in the same time
 
@@ -563,23 +554,28 @@ class PreloadMoETorchTransformer(TorchTransformer):
                                 else:
                                     gpu_expert = (gpu_expert + 1) % layer.feed_forward.num_expert_cache
 
+                                start_time = time.time()
                                 layer.feed_forward.load_expert_cpu_to_gpu(expert, gpu_expert, num_threads)
+                                end_time = time.time()
+
+                                elapsed_time = (end_time - start_time) * 1000
+                                print(f"expert load time: {elapsed_time} ms")
+
                                 layer.feed_forward.loaded_expert[gpu_expert] = j
-                                # print("Cache miss. copy expert ID:", j)
+                                print("Cache miss. copy expert ID:", j)
                             else:
                                 gpu_expert = layer.feed_forward.loaded_expert.index(j)
-                                # print("Cache hit. hit expert ID:", j)
-                            # memory_stats = torch.cuda.memory_stats()
-                            # print("current alloc mem GB:",memory_stats["allocated_bytes.all.current"]/(1024**3))
+                                print("Cache hit. hit expert ID:", j)
 
             # Sync
-            self.lib.synchronizeStream(self.stream)
+            # self.lib.synchronizeStream(self.stream)
             self.lib.synchronizeStream(self.normal_stream)
 
             ## VERY IMPORTANT: COMPUTE MUST BE IN FRONT OF COPY, OTHER WISE THEY WON'T PARALLEL!!   
 
-            # normal MoEFFN when Decode
             with torch.cuda.stream(self.normal_stream):
+
+                # normal i MoEFFN when Decode
                 if start_pos != 0:
                     for j, expert in enumerate(layer.feed_forward.experts):
                         mask = (flat_expert_indices == j)
@@ -588,53 +584,111 @@ class PreloadMoETorchTransformer(TorchTransformer):
 
                             start_time = time.time()
                             y[mask] = layer.feed_forward.experts_gpu[gpu_expert](z[mask])
-
                             end_time = time.time()
                             elapsed_time = (end_time - start_time) * 1000
-                            # print(f"expert compute time: {elapsed_time} ms")
+                            print(f"expert compute time: {elapsed_time} ms")
                     
                 y = (y.view(*expert_weights.shape, -1) * expert_weights.unsqueeze(-1)).sum(dim=1)
                 y = y.view(*orig_shape)
                 h = y + h_store
 
-            next_feedforward = self.layers[i+1].feed_forward if i+1 < self.n_layers else None
-            # Preload
-            if next_feedforward is not None:
+                #normal i+1 Attn
+                next_attention = self.layers[i+1].attention if i+1 < self.n_layers else None
+
+                if next_attention is not None:
+                    h = h + next_attention.forward(
+                        self.layers[i+1].attention_norm(h), start_pos, freqs_cis, attn_mask
+                    )
+                    h_store = h
+
+                # normal Gate for i+1 layer expert
+                next_feedforward = self.layers[i+1].feed_forward if i+1 < self.n_layers else None
+
+                if next_feedforward is not None:
+
+                    z = self.layers[i+1].ffn_norm(h_store)
+
+                    orig_shape = z.shape
+                    z = z.view(-1, z.shape[-1])
+
+                    if next_feedforward.gate_softmax:
+                        scores = next_feedforward.gate(z).softmax(dim=-1)
+                    else:
+                        scores = next_feedforward.gate(z)
+
+                    expert_weights, expert_indices = torch.topk(
+                        scores, next_feedforward.num_experts_per_tok, dim=-1)
+                    expert_weights = expert_weights.softmax(dim=-1)
+
+                    flat_expert_indices = expert_indices.view(-1)
+
+                    z = z.repeat_interleave(next_feedforward.num_experts_per_tok, dim=0)
+                    y = torch.empty_like(z)
+
+                    print("Selected experts", expert_indices)
+
+                # predict i+2 expert
+                predict_feedforward = self.layers[i+2].feed_forward if i+2 < self.n_layers else None
+
+                if predict_feedforward is not None:
+                    x = self.layers[i+2].ffn_norm(h_store)
+                    x = x.view(-1, x.shape[-1])
+
+                    if predict_feedforward.gate_softmax:
+                        scores = predict_feedforward.gate(x).softmax(dim=-1)
+                    else:
+                        scores = predict_feedforward.gate(x)
+
+                    predict_expert_weights, predict_expert_indices = torch.topk(
+                        scores, predict_feedforward.num_experts_per_tok, dim=-1)
+                    
+                    predict_flat_expert_indices = predict_expert_indices.view(-1)
+                    print("Predict experts", predict_expert_indices)
+
+            # Preload i+1 expert
+            preload_feedforward = self.layers[i+1].feed_forward if i+1 < self.n_layers else None
+
+            if preload_feedforward is not None:
                 pre_gpu_expert = 0
 
                 if start_pos == 0: #Prefill. We simply load expert 0 and 1, since it will use all of the expert mostly
 
-                    predict_flat_expert_indices = torch.tensor([0, 1])
+                    preload_flat_expert_indices = torch.tensor([0, 1])
 
-                    for j, expert in enumerate(next_feedforward.experts):
-                        expert_mask = (predict_flat_expert_indices == j)
+                    for j, expert in enumerate(preload_feedforward.experts):
+                        expert_mask = (preload_flat_expert_indices == j)
                         if expert_mask.any():
                             num_threads = 4
-                            if j not in next_feedforward.loaded_expert:
-                                if -1 in next_feedforward.loaded_expert:
-                                    pre_gpu_expert = next_feedforward.loaded_expert.index(-1)
+                            if j not in preload_feedforward.loaded_expert:
+                                if -1 in preload_feedforward.loaded_expert:
+                                    pre_gpu_expert = preload_feedforward.loaded_expert.index(-1)
                                 else:
-                                    pre_gpu_expert = (pre_gpu_expert + 1) % next_feedforward.num_expert_cache
-                                next_feedforward.load_expert_cpu_to_gpu_on_stream(expert, pre_gpu_expert, num_threads, self.stream, self.lib)
-                                next_feedforward.loaded_expert[pre_gpu_expert] = j
+                                    pre_gpu_expert = (pre_gpu_expert + 1) % preload_feedforward.num_expert_cache
+                                preload_feedforward.load_expert_cpu_to_gpu_on_stream(expert, pre_gpu_expert, num_threads, self.stream, self.lib)
+                                preload_feedforward.loaded_expert[pre_gpu_expert] = j
                             else:
-                                pre_gpu_expert = next_feedforward.loaded_expert.index(j)
+                                pre_gpu_expert = preload_feedforward.loaded_expert.index(j)
                 else: # Decode
 
-                    for j, expert in enumerate(next_feedforward.experts):
-                        expert_mask = (predict_flat_expert_indices == j)
+                    for j, expert in enumerate(preload_feedforward.experts):
+                        expert_mask = (preload_flat_expert_indices == j)
                         if expert_mask.any():
                             num_threads = 4
-                            if j not in next_feedforward.loaded_expert:
-                                if -1 in next_feedforward.loaded_expert:
-                                    pre_gpu_expert = next_feedforward.loaded_expert.index(-1)
+                            if j not in preload_feedforward.loaded_expert:
+                                if -1 in preload_feedforward.loaded_expert:
+                                    pre_gpu_expert = preload_feedforward.loaded_expert.index(-1)
                                 else:
-                                    pre_gpu_expert = (pre_gpu_expert + 1) % next_feedforward.num_expert_cache
+                                    pre_gpu_expert = (pre_gpu_expert + 1) % preload_feedforward.num_expert_cache
 
-                                next_feedforward.load_expert_cpu_to_gpu_on_stream(expert, pre_gpu_expert, num_threads, self.stream, self.lib)
-                                next_feedforward.loaded_expert[pre_gpu_expert] = j
+                                start_time = time.time()
+                                preload_feedforward.load_expert_cpu_to_gpu_on_stream(expert, pre_gpu_expert, num_threads, self.stream, self.lib)
+                                end_time = time.time()
+                                elapsed_time = (end_time - start_time) * 1000
+                                print(f"expert preload time: {elapsed_time} ms")
+
+                                preload_feedforward.loaded_expert[pre_gpu_expert] = j
                             else:
-                                pre_gpu_expert = next_feedforward.loaded_expert.index(j)
+                                pre_gpu_expert = preload_feedforward.loaded_expert.index(j)
 
         torch.cuda.synchronize()
         

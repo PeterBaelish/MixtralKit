@@ -42,9 +42,12 @@ class TorchFFN_HQQ(nn.Module):
         ).to(device)
 
     def forward(self, x):
+        '''
         device = x.device
         x = x.to(self.w1.W_q.device)
         return self.w2(F.silu(self.w1(x)) * self.w3(x)).to(device)
+        '''
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class TorchFFN(nn.Module):
     def __init__(
